@@ -14,18 +14,15 @@ class ImagePreprocessor:
             # Using yolo11n-seg.pt for speed/efficiency
             self.model = YOLO("yolo11n-seg.pt")
 
-    def process_folder(
-        self, input_dir: Union[str, Path], output_dir: Optional[Union[str, Path]] = None
+    def validate_folder(
+        self, input_dir: Union[str, Path]
     ) -> dict:
         """
-        Process all images in the input directory.
-        If output_dir is provided, saves processed images there.
+        Validate all images in the input directory without saving them.
         Returns a dictionary with lists of 'trained', 'skipped', and 'failed' file paths.
+        Images are validated in-memory to check if they pass the crop_focus filter.
         """
         input_path = Path(input_dir).resolve()
-        if output_dir:
-            output_path = Path(output_dir)
-            output_path.mkdir(parents=True, exist_ok=True)
 
         stats = {
             "base_folder": str(input_path),
@@ -40,27 +37,40 @@ class ImagePreprocessor:
             if file_path.suffix.lower() in valid_extensions:
                 try:
                     img = Image.open(file_path).convert("RGB")
-                    processed_img = self.process_image(img)
-
-                    if processed_img is None:
-                        stats["skipped"].append(str(file_path))
-                        continue
-
-                    if output_dir:
-                        save_path = output_path / f"{file_path.stem}.png"
-                        processed_img.save(save_path)
-                        stats["trained"].append(str(save_path))
-                    else:
-                        # If not saving, we still count it as trained for the log,
-                        # but maybe we should return the object?
-                        # For this specific tool usage, we assume saving is the norm.
-                        stats["trained"].append(str(file_path))
+                    
+                    # Only validate if crop_focus is set
+                    if self.crop_focus and self.model:
+                        # Check if the image contains the target object
+                        if not self._has_target_object(img):
+                            stats["skipped"].append(str(file_path))
+                            continue
+                    
+                    # Image is valid, record the original path
+                    stats["trained"].append(str(file_path))
 
                 except Exception as e:
                     print(f"Error processing {file_path}: {e}")
                     stats["failed"].append(str(file_path))
 
         return stats
+    
+    def _has_target_object(self, image: Image.Image) -> bool:
+        """
+        Check if the image contains the target object for crop_focus.
+        Returns True if target found, False otherwise.
+        """
+        results = self.model(image, verbose=False)
+        
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                cls_id = int(box.cls[0])
+                cls_name = self.model.names[cls_id]
+                
+                if cls_name.lower() == self.crop_focus.lower():
+                    return True
+        
+        return False
 
     def process_image(self, image: Image.Image) -> Optional[Image.Image]:
         """

@@ -1,6 +1,6 @@
 import click
 from pathlib import Path
-from src.train import train_lora
+from train import train_lora
 
 
 @click.command()
@@ -48,17 +48,15 @@ def main(
     input_path = Path(input_dir)
 
     if output_dir is None:
-        # Default to cwd
-        output_dir = Path.cwd()
+        # Default to cwd with constructed name
+        base_name = Path(base_model).stem if Path(base_model).exists() else base_model.split("/")[-1]
+        folder_name = input_path.name
+        output_name = f"{base_name}_{folder_name}"
+        final_output_dir = Path.cwd() / output_name
     else:
-        output_dir = Path(output_dir)
-
-    # Construct output name: {base_model_name}_{folder_basename}
-    base_name = base_model.split("/")[-1]
-    folder_name = input_path.name
-    output_name = f"{base_name}_{folder_name}"
-
-    final_output_dir = output_dir / output_name
+        # Use the user-specified output directory as-is
+        final_output_dir = Path(output_dir)
+    
     final_output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Training LoRA for {base_model} on {input_dir}")

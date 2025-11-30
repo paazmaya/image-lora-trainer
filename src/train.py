@@ -19,8 +19,8 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoTokenizer, CLIPTextModel
 from tqdm.auto import tqdm
 
-from src.dataset import LocalImageDataset
-from src.preprocess import ImagePreprocessor
+from dataset import LocalImageDataset
+from preprocess import ImagePreprocessor
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,20 @@ def train_lora(
     train_batch_size: int = 1,
     gradient_accumulation_steps: int = 4,
 ):
+    # Check for GPU availability - training on CPU is impractically slow for diffusion models
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA GPU is required for training. CPU training is too slow for diffusion models.\n"
+            "Please ensure you have:\n"
+            "1. A CUDA-compatible GPU installed\n"
+            "2. CUDA drivers installed\n"
+            "3. PyTorch with CUDA support installed\n"
+            "Check GPU availability with: python -c 'import torch; print(torch.cuda.is_available())'"
+        )
+    
+    logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    logger.info(f"CUDA version: {torch.version.cuda}")
+    
     accelerator_project_config = ProjectConfiguration(
         project_dir=output_dir, logging_dir=os.path.join(output_dir, "logs")
     )
@@ -54,34 +68,177 @@ def train_lora(
         level=logging.INFO,
     )
 
-    # Load Tokenizer & Text Encoder
-    # Assumes SD 1.5 structure for now. For SDXL, this needs adaptation.
+    # Determine if base_model is a local .safetensors file or a HF repo
+    base_model_path = Path(base_model)
+    is_local_safetensors = base_model_path.exists() and base_model_path.suffix == ".safetensors"
+    
+    if is_local_safetensors:
+        logger.info(f"Detected local .safetensors file: {base_model}")
+        # For local .safetensors files, we'll load the weights from the file
+        # and only download small config files from HF
+        # Assuming SDXL for .safetensors files (most common case)
+        component_repo = "stabilityai/stable-diffusion-xl-base-1.0"
+        logger.info(f"Loading configs from {component_repo}, weights from local file")
+        
+        # Load the full state dict once
+        from safetensors.torch import load_file
+        logger.info(f"Loading weights from {base_model}")
+        full_state_dict = load_file(str(base_model_path))
+        logger.info(f"Loaded {len(full_state_dict)} keys from .safetensors file")
+        
+        model_source = component_repo
+    else:
+        # It's a HF repo ID or a local directory with the full model structure
+        model_source = base_model
+        full_state_dict = None
+
+    # Load Tokenizer (small, config only)
     tokenizer = AutoTokenizer.from_pretrained(
-        base_model, subfolder="tokenizer", use_fast=False
+        model_source, subfolder="tokenizer", use_fast=False
     )
-    text_encoder = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder")
+    
+    # Load Scheduler (small, config only)
+    noise_scheduler = DDPMScheduler.from_pretrained(model_source, subfolder="scheduler")
+
+    # Load Text Encoder
+    if is_local_safetensors:
+        logger.info("Loading text encoder config and weights from local file")
+        from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTextConfig
+        
+        # Download only the config (small JSON file)
+        config = CLIPTextConfig.from_pretrained(
+            component_repo, subfolder="text_encoder"
+        )
+        # Initialize model from config without weights
+        text_encoder = CLIPTextModel(config)
+        
+        # Extract text encoder weights from state dict
+        text_encoder_keys = [k for k in full_state_dict.keys() if "text_encoder" in k or "cond_stage_model" in k]
+        if text_encoder_keys:
+            # Map keys from checkpoint format to HF format
+            te_state_dict = {}
+            for k in text_encoder_keys:
+                new_key = k.replace("cond_stage_model.", "").replace("text_encoder.", "")
+                te_state_dict[new_key] = full_state_dict[k]
+            
+            text_encoder.load_state_dict(te_state_dict, strict=False)
+            logger.info(f"Loaded text encoder weights ({len(text_encoder_keys)} keys)")
+        else:
+            logger.warning("No text encoder weights found in local file, using random initialization")
+    else:
+        text_encoder = CLIPTextModel.from_pretrained(model_source, subfolder="text_encoder")
+    
     text_encoder.requires_grad_(False)
 
-    # Load Scheduler
-    noise_scheduler = DDPMScheduler.from_pretrained(base_model, subfolder="scheduler")
+    # Load second text encoder for SDXL
+    text_encoder_2 = None
+    tokenizer_2 = None
+    if is_local_safetensors or "xl" in model_source.lower():
+        logger.info("Loading second text encoder for SDXL")
+        if is_local_safetensors:
+            from transformers import CLIPTextModelWithProjection
+            config_2 = CLIPTextConfig.from_pretrained(
+                component_repo, subfolder="text_encoder_2"
+            )
+            text_encoder_2 = CLIPTextModelWithProjection(config_2)
+            
+            # Try to load weights for text_encoder_2
+            te2_keys = [k for k in full_state_dict.keys() if "text_encoder_2" in k or "conditioner" in k]
+            if te2_keys:
+                te2_state_dict = {}
+                for k in te2_keys:
+                    new_key = k.replace("text_encoder_2.", "").replace("conditioner.", "")
+                    te2_state_dict[new_key] = full_state_dict[k]
+                text_encoder_2.load_state_dict(te2_state_dict, strict=False)
+                logger.info(f"Loaded text_encoder_2 weights ({len(te2_keys)} keys)")
+            else:
+                logger.warning("No text_encoder_2 weights found in local file, using random initialization")
+        else:
+            from transformers import CLIPTextModelWithProjection
+            text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+                model_source, subfolder="text_encoder_2"
+            )
+        
+        text_encoder_2.requires_grad_(False)
+        
+        # Load second tokenizer
+        tokenizer_2 = AutoTokenizer.from_pretrained(
+            model_source if not is_local_safetensors else component_repo,
+            subfolder="tokenizer_2",
+            use_fast=False
+        )
 
     # Load VAE
-    vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae")
+    if is_local_safetensors:
+        logger.info("Loading VAE config and weights from local file")
+        
+        # Download only the config (small JSON file)
+        config = AutoencoderKL.load_config(
+            component_repo, subfolder="vae"
+        )
+        # Initialize model from config without weights
+        vae = AutoencoderKL.from_config(config)
+        
+        # Extract VAE weights from state dict
+        vae_keys = [k for k in full_state_dict.keys() if "vae" in k or "first_stage_model" in k]
+        if vae_keys:
+            # Map keys from checkpoint format to HF format
+            vae_state_dict = {}
+            for k in vae_keys:
+                new_key = k.replace("first_stage_model.", "").replace("vae.", "")
+                vae_state_dict[new_key] = full_state_dict[k]
+            
+            vae.load_state_dict(vae_state_dict, strict=False)
+            logger.info(f"Loaded VAE weights ({len(vae_keys)} keys)")
+        else:
+            logger.warning("No VAE weights found in local file, using random initialization")
+    else:
+        vae = AutoencoderKL.from_pretrained(model_source, subfolder="vae")
+    
     vae.requires_grad_(False)
 
     # Load UNet
-    # For QLoRA, we need to load in 4bit if requested
-    load_kwargs = {}
-    if use_qlora:
-        load_kwargs = {
-            "load_in_4bit": True,
-            "quantization_config": None,
-            "device_map": "auto",
-        }
+    if is_local_safetensors:
+        logger.info("Loading UNet config and weights from local file")
+        
+        # Download only the config (small JSON file)
+        config = UNet2DConditionModel.load_config(
+            component_repo, subfolder="unet"
+        )
+        # Initialize model from config without weights
+        unet = UNet2DConditionModel.from_config(config)
+        
+        # Extract UNet weights from state dict
+        # Common prefixes in different checkpoint formats
+        unet_keys = [k for k in full_state_dict.keys() 
+                    if any(prefix in k for prefix in ["model.diffusion_model", "unet", "model.model"])]
+        
+        if unet_keys:
+            # Map keys from checkpoint format to HF format
+            unet_state_dict = {}
+            for k in unet_keys:
+                new_key = k.replace("model.diffusion_model.", "").replace("unet.", "").replace("model.model.", "")
+                unet_state_dict[new_key] = full_state_dict[k]
+            
+            unet.load_state_dict(unet_state_dict, strict=False)
+            logger.info(f"Loaded UNet weights ({len(unet_keys)} keys)")
+        else:
+            # If no prefixed keys found, the entire file might be just UNet weights
+            logger.warning("No UNet-specific keys found, attempting to load entire state dict as UNet")
+            unet.load_state_dict(full_state_dict, strict=False)
+    else:
+        # Load UNet from HF repo or local directory
+        load_kwargs = {}
+        if use_qlora:
+            load_kwargs = {
+                "load_in_4bit": True,
+                "quantization_config": None,
+                "device_map": "auto",
+            }
 
-    unet = UNet2DConditionModel.from_pretrained(
-        base_model, subfolder="unet", **load_kwargs
-    )
+        unet = UNet2DConditionModel.from_pretrained(
+            model_source, subfolder="unet", **load_kwargs
+        )
 
     if use_qlora:
         unet = prepare_model_for_kbit_training(unet)
@@ -113,10 +270,9 @@ def train_lora(
         eps=1e-08,
     )
 
-    # Preprocess Images
+    # Validate Images (in-memory, no disk I/O)
     preprocessor = ImagePreprocessor(resolution=resolution, crop_focus=crop_focus)
-    processed_dir = Path(output_dir) / "processed_images"
-    stats = preprocessor.process_folder(input_dir, processed_dir)
+    stats = preprocessor.validate_folder(input_dir)
 
     # Save log
     import json
@@ -124,19 +280,21 @@ def train_lora(
     with open(Path(output_dir) / "training_log.json", "w") as f:
         json.dump(stats, f, indent=4)
 
-    processed_files = [Path(p) for p in stats["trained"]]
+    valid_image_paths = [Path(p) for p in stats["trained"]]
 
-    if not processed_files:
+    if not valid_image_paths:
         raise ValueError(
             f"No valid images found in {input_dir}. Check training_log.json for details."
         )
 
-    # Dataset and Dataloader
+    # Dataset and Dataloader (preprocessing happens on-the-fly)
     train_dataset = LocalImageDataset(
-        image_paths=processed_files,
+        image_paths=valid_image_paths,
         tokenizer=tokenizer,
+        tokenizer_2=tokenizer_2,
         instance_prompt=instance_prompt,
         resolution=resolution,
+        preprocessor=preprocessor,
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -168,6 +326,8 @@ def train_lora(
 
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
+    if text_encoder_2 is not None:
+        text_encoder_2.to(accelerator.device, dtype=weight_dtype)
 
     # Training Loop
     if num_train_epochs is None:
@@ -207,6 +367,31 @@ def train_lora(
 
                 # Get text embeddings
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                
+                # For SDXL, concatenate outputs from both text encoders
+                added_cond_kwargs = None
+                if text_encoder_2 is not None and hasattr(unet.config, "addition_embed_type") and unet.config.addition_embed_type == "text_time":
+                    # Get hidden states from second text encoder
+                    encoder_hidden_states_2 = text_encoder_2(batch["input_ids_2"], output_hidden_states=False)[0]
+                    
+                    # Concatenate the two text encoder outputs
+                    encoder_hidden_states = torch.cat([encoder_hidden_states, encoder_hidden_states_2], dim=-1)
+                    
+                    # Get pooled embeddings from text_encoder_2 (CLIPTextModelWithProjection)
+                    pooled_embeds = text_encoder_2(batch["input_ids_2"], output_hidden_states=False).text_embeds
+                    
+                    # Create time_ids for SDXL (original_size, crops_coords_top_left, target_size)
+                    # Using default values for now
+                    time_ids = torch.tensor(
+                        [[resolution, resolution, 0, 0, resolution, resolution]],
+                        device=encoder_hidden_states.device,
+                        dtype=torch.long
+                    ).repeat(encoder_hidden_states.shape[0], 1)
+                    
+                    added_cond_kwargs = {
+                        "text_embeds": pooled_embeds,
+                        "time_ids": time_ids
+                    }
 
                 # Predict the noise residual
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -219,7 +404,10 @@ def train_lora(
                     )
 
                 model_pred = unet(
-                    noisy_latents, timesteps, encoder_hidden_states
+                    noisy_latents, 
+                    timesteps, 
+                    encoder_hidden_states,
+                    added_cond_kwargs=added_cond_kwargs
                 ).sample
 
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -241,10 +429,7 @@ def train_lora(
     # Save the model
     if accelerator.is_main_process:
         unet = accelerator.unwrap_model(unet)
-        # Save LoRA weights
-        # We need to construct the output name as requested: {base_model_name}_{folder_basename}
-        # But here we just save to output_dir, the caller (CLI) should handle the naming of the directory or file.
-        # PEFT saves adapter_model.bin and adapter_config.json
-
-        unet.save_pretrained(output_dir)
+        # Save LoRA weights as safetensors
+        unet.save_pretrained(output_dir, safe_serialization=True)
         logger.info(f"Model saved to {output_dir}")
+

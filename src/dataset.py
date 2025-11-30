@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -11,21 +12,19 @@ class LocalImageDataset(Dataset):
         tokenizer,
         instance_prompt: str,
         resolution: int = 512,
-        center_crop: bool = False,  # We already pre-processed, but just in case
+        preprocessor: Optional[object] = None,
+        tokenizer_2: Optional[object] = None,
     ):
         self.image_paths = image_paths
         self.tokenizer = tokenizer
+        self.tokenizer_2 = tokenizer_2
         self.instance_prompt = instance_prompt
         self.resolution = resolution
+        self.preprocessor = preprocessor
 
+        # Transforms to convert PIL image to tensor and normalize
         self.image_transforms = transforms.Compose(
             [
-                transforms.Resize(
-                    resolution, interpolation=transforms.InterpolationMode.BILINEAR
-                ),
-                transforms.CenterCrop(resolution)
-                if center_crop
-                else transforms.Lambda(lambda x: x),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
@@ -38,11 +37,25 @@ class LocalImageDataset(Dataset):
         path = self.image_paths[idx]
         image = Image.open(path).convert("RGB")
 
-        # Apply transforms
+        # Apply preprocessing (crop and resize) if preprocessor is provided
+        if self.preprocessor:
+            image = self.preprocessor.process_image(image)
+            # If process_image returns None, skip this image
+            # (though this shouldn't happen since we validated earlier)
+            if image is None:
+                # Fallback to next image or raise error
+                # For now, we'll just use a blank image
+                image = Image.new("RGB", (self.resolution, self.resolution), (0, 0, 0))
+        else:
+            # No preprocessor, just resize
+            image = image.resize(
+                (self.resolution, self.resolution), Image.Resampling.LANCZOS
+            )
+
+        # Convert to tensor and normalize
         pixel_values = self.image_transforms(image)
 
         # Tokenize prompt
-        # Note: This assumes a single prompt for all images for now (DreamBooth style)
         input_ids = self.tokenizer(
             self.instance_prompt,
             padding="max_length",
@@ -51,7 +64,20 @@ class LocalImageDataset(Dataset):
             return_tensors="pt",
         ).input_ids[0]
 
-        return {
+        result = {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
         }
+        
+        # Add second tokenizer output for SDXL
+        if self.tokenizer_2 is not None:
+            input_ids_2 = self.tokenizer_2(
+                self.instance_prompt,
+                padding="max_length",
+                truncation=True,
+                max_length=self.tokenizer_2.model_max_length,
+                return_tensors="pt",
+            ).input_ids[0]
+            result["input_ids_2"] = input_ids_2
+
+        return result

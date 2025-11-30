@@ -4,6 +4,46 @@ A CLI tool to train LoRA adapters for text-to-image models using a folder of ima
 
 ![Stick figure sorting images next to a barrel](./logo.png)
 
+## How It Works
+
+```mermaid
+flowchart TD
+    Start(["📁 Input Images"]) --> Load["Load Images"]
+    Load --> Check{"Crop Focus\nSpecified?"}
+    
+    Check -->|Yes| YOLO["🔍 YOLO11 Detection"]
+    Check -->|No| Center["Center Crop"]
+    
+    YOLO --> Found{"Target\nFound?"}
+    Found -->|Yes| Crop["Smart Crop\n+ Padding"]
+    Found -->|No| Skip["⏭️ Skip Image"]
+    
+    Center --> Resize["Resize to\nTarget Resolution"]
+    Crop --> Resize
+    
+    Resize --> Train["🎯 LoRA Training\n(Diffusers + PEFT)"]
+    Skip --> Log
+    
+    Train --> Save["💾 Save LoRA\nWeights"]
+    Save --> Log["📊 Generate\ntraining_log.json"]
+    
+    Log --> End(["✅ Trained LoRA\n+ Logs"])
+    
+    style Start fill:#E8F4F8,stroke:#2C5F7C,stroke-width:3px,color:#1a1a1a
+    style Load fill:#FFF4E6,stroke:#8B6914,stroke-width:2px,color:#1a1a1a
+    style Check fill:#F0E6FF,stroke:#6B46C1,stroke-width:2px,color:#1a1a1a
+    style YOLO fill:#E6F7FF,stroke:#1E5A8E,stroke-width:2px,color:#1a1a1a
+    style Center fill:#FFF0F5,stroke:#8B4789,stroke-width:2px,color:#1a1a1a
+    style Found fill:#F0E6FF,stroke:#6B46C1,stroke-width:2px,color:#1a1a1a
+    style Crop fill:#E6FFE6,stroke:#2D5F2D,stroke-width:2px,color:#1a1a1a
+    style Skip fill:#FFE6E6,stroke:#8B2E2E,stroke-width:2px,color:#1a1a1a
+    style Resize fill:#FFF4E6,stroke:#8B6914,stroke-width:2px,color:#1a1a1a
+    style Train fill:#E6F7FF,stroke:#1E5A8E,stroke-width:2px,color:#1a1a1a
+    style Save fill:#E6FFE6,stroke:#2D5F2D,stroke-width:2px,color:#1a1a1a
+    style Log fill:#FFF4E6,stroke:#8B6914,stroke-width:2px,color:#1a1a1a
+    style End fill:#E8F4F8,stroke:#2C5F7C,stroke-width:3px,color:#1a1a1a
+```
+
 ## Features
 
 - **Content-Aware Cropping**: Uses YOLO11 segmentation to automatically detect and crop to specific objects from [the COCO dataset (faces, people, animals, etc.)](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/coco.yaml)
@@ -25,6 +65,38 @@ cd image-lora-trainer
 # Install dependencies
 uv sync
 ```
+
+### GPU Setup (Required)
+
+**This tool requires a CUDA-capable GPU.** Training on CPU is impractically slow for diffusion models.
+
+1. **Verify you have a CUDA-capable NVIDIA GPU**
+
+2. **Install CUDA 13 drivers** from [NVIDIA's website](https://developer.nvidia.com/cuda-downloads)
+
+3. **Install PyTorch with CUDA support:**
+
+   ```bash
+   uv pip uninstall torch torchvision -y
+   uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+   ```
+
+   Its about 1.73 GB to download.
+
+4. **Verify GPU is detected:**
+
+   ```bash
+   uv run python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')"
+   ```
+
+   You should see something like:
+   
+   ```
+   CUDA available: True
+   GPU: NVIDIA GeForce RTX 4070 Ti
+   ```
+
+   If you see `CUDA available: False`, the CPU-only version of PyTorch is installed. Follow step 3 above.
 
 ## Quick Start
 
@@ -86,6 +158,17 @@ uv run python src/generate.py \
   --output result.png
 ```
 
+**Important:** Use the same trigger word ("sks" in this example) that you specified in `--instance-prompt` during training.
+
+More generation examples:
+```bash
+# Portrait with different styling
+uv run python src/generate.py --lora-path <path> --prompt "portrait of sks person, oil painting"
+
+# Different context
+uv run python src/generate.py --lora-path <path> --prompt "sks person in a futuristic city"
+```
+
 ## CLI Options
 
 ### Training (`src/main.py`)
@@ -98,9 +181,16 @@ uv run python src/generate.py \
 | `--resolution` | Training image resolution | 512 |
 | `--crop-focus` | Object to focus on (e.g., "person", "face", "dog") | None (center crop) |
 | `--use-qlora` | Enable 4-bit quantization | False |
-| `--instance-prompt` | Training prompt | "a photo of a sks person" |
+| `--instance-prompt` | Training prompt with trigger word | "a photo of a sks person" |
 | `--steps` | Number of training steps | 1000 |
 | `--epochs` | Number of epochs (overrides steps) | None |
+
+**About `--instance-prompt`:**
+The instance prompt contains a **trigger word** (like "sks") that the model learns to associate with your training images. This trigger word is what you'll use later when generating images with the LoRA.
+
+- Use a unique, uncommon token (e.g., "sks", "xyz", "abc123")
+- Include the class name (e.g., "person", "dog", "style")
+- Example: `"a photo of sks person"` → Use `"sks person"` in generation prompts
 
 ### Generation (`src/generate.py`)
 
