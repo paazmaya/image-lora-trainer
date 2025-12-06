@@ -1,5 +1,5 @@
 from PIL import Image
-from src.dataset import LocalImageDataset
+from lib.dataset import LocalImageDataset
 
 
 class MockTokenizer:

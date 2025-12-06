@@ -49,8 +49,9 @@ flowchart TD
 - **Content-Aware Cropping**: Uses YOLO11 segmentation to automatically detect and crop to specific objects from [the COCO dataset (faces, people, animals, etc.)](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/coco.yaml)
 - **Smart Filtering**: Automatically skips images that don't contain the target feature
 - **Training Logs**: Generates detailed JSON logs of processed, skipped, and failed images
-- **LoRA/QLoRA Training**: Full training pipeline using `diffusers` and `peft` with optional 4-bit quantization
-- **Multiple Model Support**: Works with Stable Diffusion 1.5, SDXL, and other diffusion models
+- **LoRA/QLoRA Training**: Full training pipeline using `diffusers` and `peft` with optional quantization
+- **Multiple Model Support**: Works with Stable Diffusion 1.5, SDXL, and **Z-Image-Turbo** (fast 8-step DiT model)
+- **Z-Image-Turbo Support**: Train LoRAs for the new 6B parameter single-stream DiT model with 8-bit quantization
 - **Visual Verification**: Includes a generation script to test your trained LoRA
 
 ## Installation
@@ -136,6 +137,51 @@ uv run python src/main.py \
   --resolution 1024
 ```
 
+### Training Z-Image-Turbo LoRA
+
+[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) is a fast 6B parameter diffusion transformer that produces high-quality images in just 8 steps.
+
+Basic Z-Image training:
+```bash
+uv run python src/main.py train-zimage \
+  --input-dir my_images \
+  --instance-prompt "a photo of sks person"
+```
+
+With 8-bit quantization (for lower VRAM usage, ~12GB instead of ~24GB):
+```bash
+uv run python src/main.py train-zimage \
+  --input-dir my_images \
+  --instance-prompt "a photo of sks person" \
+  --use-8bit \
+  --steps 500
+```
+
+With all options:
+```bash
+uv run python src/main.py train-zimage \
+  --input-dir my_images \
+  --instance-prompt "a photo of sks karate practitioner" \
+  --crop-focus person \
+  --use-8bit \
+  --lr 1e-5 \
+  --lora-rank 16 \
+  --steps 1000
+```
+
+With locally available model:
+
+
+Learning rate: 1e-5 (lower than SD/SDXL)
+LoRA rank: 16 (can go higher for more capacity)
+Steps: 500-1500 for characters/styles
+
+```ps1
+uv run python src/main.py train-zimage --base-model "H:\z-image-turbo" --input-dir "C:\Users\Jukka\Dropbox\Karatejukka 2023\" --instance-prompt "karatejukka" --use-8bit --output-dir "C:\Users\Jukka\Dropbox\Karatejukka-2023-Z-image-turbo-lora\"
+```
+
+**Note:** Z-Image-Turbo uses a [training adapter](https://huggingface.co/ostris/zimage_turbo_training_adapter) by default to prevent the distillation from breaking during training. This is recommended for short training runs (styles, concepts, characters).
+
 ### 3. Check Training Results
 
 After training, check the `training_log.json` in your output directory:
@@ -150,11 +196,20 @@ After training, check the `training_log.json` in your output directory:
 
 ### 4. Generate Images with Your LoRA
 
+For Stable Diffusion:
 ```bash
-uv run python src/generate.py \
+uv run python src/generate.py sd \
   --base-model runwayml/stable-diffusion-v1-5 \
   --lora-path stable-diffusion-v1-5_my_images \
   --prompt "a photo of a sks person" \
+  --output result.png
+```
+
+For Z-Image-Turbo:
+```bash
+uv run python src/generate.py zimage \
+  --lora-path zimage-turbo_my_images \
+  --prompt "a photo of sks person, professional studio lighting" \
   --output result.png
 ```
 
@@ -171,7 +226,7 @@ uv run python src/generate.py --lora-path <path> --prompt "sks person in a futur
 
 ## CLI Options
 
-### Training (`src/main.py`)
+### Training SD/SDXL (`src/main.py train`)
 
 | Option | Description | Default |
 |--------|-------------|---------|
@@ -185,6 +240,24 @@ uv run python src/generate.py --lora-path <path> --prompt "sks person in a futur
 | `--steps` | Number of training steps | 1000 |
 | `--epochs` | Number of epochs (overrides steps) | None |
 
+### Training Z-Image-Turbo (`src/main.py train-zimage`)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--input-dir` | Path to training images | Required |
+| `--output-dir` | Output directory for LoRA | Current directory |
+| `--base-model` | Z-Image model ID | `Tongyi-MAI/Z-Image-Turbo` |
+| `--resolution` | Training image resolution | 1024 |
+| `--crop-focus` | Object to focus on | None (center crop) |
+| `--use-8bit` | Enable 8-bit quantization | False |
+| `--no-training-adapter` | Disable de-distillation adapter | False (adapter enabled) |
+| `--instance-prompt` | Training prompt with trigger word | "a photo of a sks person" |
+| `--steps` | Number of training steps | 1000 |
+| `--lr` | Learning rate | 1e-5 |
+| `--lora-rank` | LoRA rank | 16 |
+| `--lora-alpha` | LoRA alpha | 16 |
+| `--save-steps` | Save checkpoint every N steps | 500 |
+
 **About `--instance-prompt`:**
 The instance prompt contains a **trigger word** (like "sks") that the model learns to associate with your training images. This trigger word is what you'll use later when generating images with the LoRA.
 
@@ -192,8 +265,9 @@ The instance prompt contains a **trigger word** (like "sks") that the model lear
 - Include the class name (e.g., "person", "dog", "style")
 - Example: `"a photo of sks person"` → Use `"sks person"` in generation prompts
 
-### Generation (`src/generate.py`)
+### Generation (`src/generate.py sd` / `src/generate.py zimage`)
 
+**SD Generation Options:**
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--base-model` | Base model ID or path | `runwayml/stable-diffusion-v1-5` |
@@ -201,6 +275,19 @@ The instance prompt contains a **trigger word** (like "sks") that the model lear
 | `--prompt` | Generation prompt | Required |
 | `--output` | Output filename | `output.png` |
 | `--steps` | Inference steps | 30 |
+
+**Z-Image Generation Options:**
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--base-model` | Z-Image model ID | `Tongyi-MAI/Z-Image-Turbo` |
+| `--lora-path` | Path to trained LoRA | Required |
+| `--prompt` | Generation prompt | Required |
+| `--output` | Output filename | `output.png` |
+| `--width` | Image width | 1024 |
+| `--height` | Image height | 1024 |
+| `--steps` | Inference steps | 8 |
+| `--seed` | Random seed | None (random) |
+| `--lora-scale` | LoRA weight scale | 1.0 |
 
 ## Content-Aware Cropping
 
@@ -246,8 +333,10 @@ stable-diffusion-v1-5_my_images/
 ## Requirements
 
 - Python 3.13+
-- CUDA-capable GPU (recommended)
-- ~8GB VRAM for SD1.5, ~16GB for SDXL (less with QLoRA)
+- CUDA-capable GPU (required)
+- **Stable Diffusion 1.5**: ~8GB VRAM (less with QLoRA)
+- **SDXL**: ~16GB VRAM (less with QLoRA)
+- **Z-Image-Turbo**: ~24GB VRAM (or ~12GB with 8-bit quantization)
 
 ## License
 
@@ -258,3 +347,5 @@ stable-diffusion-v1-5_my_images/
 - Built with [Ultralytics YOLO11](https://docs.ultralytics.com/models/yolo11/)
 - Uses [Hugging Face Diffusers](https://github.com/huggingface/diffusers)
 - LoRA implementation via [PEFT](https://github.com/huggingface/peft)
+- Z-Image-Turbo by [Tongyi-MAI](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)
+- Z-Image training adapter by [ostris](https://huggingface.co/ostris/zimage_turbo_training_adapter)

@@ -6,6 +6,8 @@ from torchvision import transforms
 
 
 class LocalImageDataset(Dataset):
+    """Base dataset for loading local images with CLIP tokenization (SD/SDXL)."""
+
     def __init__(
         self,
         image_paths: list[Path],
@@ -68,7 +70,7 @@ class LocalImageDataset(Dataset):
             "pixel_values": pixel_values,
             "input_ids": input_ids,
         }
-        
+
         # Add second tokenizer output for SDXL
         if self.tokenizer_2 is not None:
             input_ids_2 = self.tokenizer_2(

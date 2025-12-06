@@ -1,5 +1,5 @@
 from PIL import Image
-from src.preprocess import ImagePreprocessor
+from lib.preprocess import ImagePreprocessor
 
 
 def test_center_crop_and_resize():
