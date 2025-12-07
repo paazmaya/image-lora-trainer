@@ -3,6 +3,7 @@ name = "image-lora-trainer"
 version = "0.1.0"
 description = "Train LoRA adapters for Stable Diffusion, SDXL, and Z-Image-Turbo"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.13"
 dependencies = [
     "accelerate>=1.12.0",
